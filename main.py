@@ -12,20 +12,19 @@ from matplotlib import pyplot as plt
 configuration = tf.compat.v1.ConfigProto(device_count={"GPU": 0})
 session = tf.compat.v1.Session(config=configuration)
 
-keys_dict = ['тон', 'шаг', 'задержка']
+keys_dict = ['pitch', 'step', 'duration']
 
 
 #убрать counter потом
 def get_midi():
     music_list = []
-    counter = 1
     print("================FILES================")
+    counter = 0
     for file in glob.glob("2018/*.midi"):
-        if counter != 2:
+        if counter < 15:
             pm = pretty_midi.PrettyMIDI(file)
-            print(file)
+            print(counter, file)
             music_list.append(pm)
-
             counter += 1
     return music_list
 
@@ -54,11 +53,11 @@ def get_notes(msc) -> pd.DataFrame:
         for note in sorted_notes:
             start = note.start
             end = note.end
-            notes['тон'].append(note.pitch)
-            notes['начало'].append(start)
-            notes['конец'].append(end)
-            notes['шаг'].append(start - prev_start)
-            notes['задержка'].append(end - start)
+            notes['pitch'].append(note.pitch)
+            notes['start'].append(start)
+            notes['end'].append(end)
+            notes['step'].append(start - prev_start)
+            notes['duration'].append(end - start)
             prev_start = start
     return pd.DataFrame({name: np.array(value) for name, value in notes.items()})
 
@@ -70,8 +69,8 @@ def plot_music_roll(notes: pd.DataFrame, count: Optional[int] = None):
         title = f'Целый датасет'
         count = len(notes['тон'])
     plt.figure(figsize=(20,4))
-    plot_pitch = np.stack([notes['тон'], notes['тон']], axis=0)
-    plot_start_and_stop = np.stack([notes['начало'], notes['конец']], axis=0)
+    plot_pitch = np.stack([notes['pitch'], notes['pitch']], axis=0)
+    plot_start_and_stop = np.stack([notes['start'], notes['end']], axis=0)
     plt.plot(
         plot_start_and_stop[:, :count], plot_pitch[:, :count], color='b', marker='')
     plt.xlabel('Время сек.')
@@ -88,12 +87,12 @@ def plot_table(notes: pd.DataFrame, drop_percentile=2.5):
     plt.show()
     # Выводим график шага
     plt.subplot(1, 3, 2)
-    max_step = np.percentile(notes['шаг'], 100 - drop_percentile)
+    max_step = np.percentile(notes['step'], 100 - drop_percentile)
     sns.histplot(notes, x="шаг", bins=np.linspace(0, max_step, 21))
     plt.show()
     # Выводим график продолжительности мелодии через задержку
     plt.subplot(1, 3, 3)
-    max_duration = np.percentile(notes['задержка'], 100 - drop_percentile)
+    max_duration = np.percentile(notes['duration'], 100 - drop_percentile)
     sns.histplot(notes, x="задержка", bins=np.linspace(0, max_duration, 21))
     plt.show()
 
@@ -112,17 +111,16 @@ def notes_to_music_format_midi(
 
   first_start = 0
   for i, note in notes.iterrows():
-    start = float(first_start + note['шаг'])
-    end = float(start + note['задержка'])
+    start = float(first_start + note['step'])
+    end = float(start + note['duration'])
     note = pretty_midi.Note(
         velocity=velocity,
-        pitch=int(note['тон']),
+        pitch=int(note['pitch']),
         start=start,
         end=end,
     )
     instrument.notes.append(note)
     first_start = start
-
   pm.instruments.append(instrument)
   pm.write(out_file)
   print('OK')
@@ -162,6 +160,112 @@ def sequence_notes(dataset: tf.data.Dataset, seq_len : int, vocab_size = 128, ) 
     return sequences.map(split, num_parallel_calls=tf.data.AUTOTUNE)
 
 
+#делаем функцию для ноты и задержки
+def mse_handler_pitch_duration(y_true: tf.Tensor, y_pred: tf.Tensor):
+    mse = (y_true - y_pred) **2
+    print(mse)
+    pressure = 10 * tf.maximum(-y_pred, 0.0)
+    return tf.reduce_mean(mse + pressure)
+
+
+def tf_model(seq_length, msc, instrument_name):
+    notes = get_notes(msc)
+    input_shape = (seq_length, 3)
+    print(input_shape)
+    learning_rate = 0.005
+    inputs = tf.keras.Input(input_shape)
+    x = tf.keras.layers.LSTM(128)(inputs)
+
+    outputs = {
+        'pitch': tf.keras.layers.Dense(128, name='pitch')(x),
+        'step': tf.keras.layers.Dense(1, name='step')(x),
+        'duration': tf.keras.layers.Dense(1, name='duration')(x),
+    }
+
+    model = tf.keras.Model(inputs, outputs)
+
+    loss = {
+        'pitch': tf.keras.losses.SparseCategoricalCrossentropy(
+            from_logits=True),
+        'step': mse_handler_pitch_duration,
+        'duration': mse_handler_pitch_duration,
+    }
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    model.compile(
+        loss=loss,
+        loss_weights={
+            'pitch': 1.6,
+            'step': 1.0,
+            'duration': 1.0,
+        },
+        optimizer=optimizer,
+    )
+    model.evaluate(train_ds, return_dict=True)
+    print(model.summary())
+    losses = model.evaluate(train_ds, return_dict=True)
+    print(losses)
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath='./training_checkpoints/ckpt_{epoch}',
+            save_weights_only=True),
+        tf.keras.callbacks.EarlyStopping(
+            monitor='loss',
+            patience=5,
+            verbose=1,
+            restore_best_weights=True),
+    ]
+    epochs = 50 #колво прогонов
+    history = model.fit(
+        train_ds,
+        epochs=epochs,
+        callbacks=callbacks,
+    )
+    plt.plot(history.epoch, history.history['loss'], label='total loss')
+    plt.show()
+    temperature = 2.0
+    num_predictions = 120
+    sample_notes = np.stack([notes[key] for key in keys_dict], axis=1)
+    input_notes = (
+            sample_notes[:seq_length] / np.array([vocab_size, 1, 1]))
+
+    generated_notes = []
+    prev_start = 0
+    for _ in range(num_predictions):
+        pitch, step, duration = predict_note(input_notes, model, temperature)
+        start = prev_start + step
+        end = start + duration
+        input_note = (pitch, step, duration)
+        generated_notes.append((*input_note, start, end))
+        input_notes = np.delete(input_notes, 0, axis=0)
+        input_notes = np.append(input_notes, np.expand_dims(input_note, 0), axis=0)
+        prev_start = start
+
+    generated_notes = pd.DataFrame(
+        generated_notes, columns=(*keys_dict, 'start', 'end'))
+    generated_notes.head(10)
+    output_file = 'ml_music.midi'
+    example_pm = notes_to_music_format_midi(
+        generated_notes, out_file=output_file, instrument_name=instrument_name)
+
+
+def predict_note(notes: np.ndarray, keras_model: tf.keras.Model,
+                   temperature: float = 1.0) -> int:
+    assert temperature > 0
+    inputs = tf.expand_dims(notes, 0)
+    predictions = keras_model.predict(inputs)
+    pitch_logits = predictions['pitch']
+    step = predictions['step']
+    duration = predictions['duration']
+    pitch_logits /= temperature
+    pitch = tf.random.categorical(pitch_logits, num_samples=1)
+    pitch = tf.squeeze(pitch, axis=-1)
+    duration = tf.squeeze(duration, axis=-1)
+    step = tf.squeeze(step, axis=-1)
+    step = tf.maximum(0, step)
+    duration = tf.maximum(0, duration)
+    return int(pitch), float(step), float(duration)
+
+
 if __name__ == '__main__':
     msc = get_midi()
     instrument = msc.__getitem__(0).instruments[0]
@@ -170,7 +274,7 @@ if __name__ == '__main__':
     row = get_notes(msc)
     row.head()
     get_more_notes = np.vectorize(pretty_midi.note_number_to_name)
-    sample_note = get_more_notes(row['тон'])
+    sample_note = get_more_notes(row['pitch'])
     #plot_music_roll(row, 100)
     #plot_music_roll(row)
     #plot_table(row)
@@ -180,12 +284,16 @@ if __name__ == '__main__':
     test_data_set_to_train, num_note = test_learning(msc)
     seq_length = 25
     vocab_size = 128
-    seq_ds = sequence_notes(test_data_set_to_train, seq_length, vocab_size)
+    seq_dataset = sequence_notes(test_data_set_to_train, seq_length, vocab_size)
     batch_size = 64
-    buffer_size = num_note - seq_length  # the number of items in the dataset
-    train_ds = (seq_ds
+    #for seq, target in seq_dataset:
+    #    print('форма последовательности: ', seq.shape)
+    #    print('элементы последовательности: ', seq[0: 10])
+    #    print('\nтаргет: ', target)
+    buffer_size = num_note - seq_length
+    train_ds = (seq_dataset
                 .shuffle(buffer_size)
                 .batch(batch_size, drop_remainder=True)
                 .cache()
                 .prefetch(tf.data.experimental.AUTOTUNE))
-    print(train_ds.element_spec)
+    tf_model(seq_length, msc, instrument_name)
