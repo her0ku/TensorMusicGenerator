@@ -20,12 +20,11 @@ def get_midi():
     music_list = []
     print("================FILES================")
     counter = 0
-    for file in glob.glob("2018/*.midi"):
-        if counter < 15:
+    for file in glob.glob("alone_th/*.mid"):
             pm = pretty_midi.PrettyMIDI(file)
             print(counter, file)
             music_list.append(pm)
-            counter += 1
+            print(pm.instruments[0])
     return music_list
 
 
@@ -67,7 +66,7 @@ def plot_music_roll(notes: pd.DataFrame, count: Optional[int] = None):
         title = f'Количество {count} нот'
     else:
         title = f'Целый датасет'
-        count = len(notes['тон'])
+        count = len(notes['pitch'])
     plt.figure(figsize=(20,4))
     plot_pitch = np.stack([notes['pitch'], notes['pitch']], axis=0)
     plot_start_and_stop = np.stack([notes['start'], notes['end']], axis=0)
@@ -83,17 +82,17 @@ def plot_table(notes: pd.DataFrame, drop_percentile=2.5):
     #Выводим график тона
     plt.figure(figsize=[15, 5])
     plt.subplot(1, 3, 1)
-    sns.histplot(notes, x="тон", bins=20)
+    sns.histplot(notes, x="pitch", bins=20)
     plt.show()
     # Выводим график шага
     plt.subplot(1, 3, 2)
     max_step = np.percentile(notes['step'], 100 - drop_percentile)
-    sns.histplot(notes, x="шаг", bins=np.linspace(0, max_step, 21))
+    sns.histplot(notes, x="step", bins=np.linspace(0, max_step, 21))
     plt.show()
     # Выводим график продолжительности мелодии через задержку
     plt.subplot(1, 3, 3)
     max_duration = np.percentile(notes['duration'], 100 - drop_percentile)
-    sns.histplot(notes, x="задержка", bins=np.linspace(0, max_duration, 21))
+    sns.histplot(notes, x="duration", bins=np.linspace(0, max_duration, 21))
     plt.show()
 
 
@@ -126,24 +125,26 @@ def notes_to_music_format_midi(
   print('OK')
   return pm
 
-#Обучение?????
+#Обучение подготовка
 def test_learning(msc):
     notes = get_notes(msc)
     num_notes = len(notes)
     #print('Test number note: ', num_notes)
-    train_notes = np.stack([notes[key] for key in keys_dict], axis=1)
-    notes_data_set = tf.data.Dataset.from_tensor_slices(train_notes)
+    train_notes = np.stack([notes[key] for key in keys_dict], axis=1) #соединение результирующего массива вдоль оси
+    notes_data_set = tf.data.Dataset.from_tensor_slices(train_notes) #входные данные
    #print(notes_data_set.element_spec)
     return notes_data_set, num_notes
 
 
+#vocab вложенный словрь размер
 def sequence_notes(dataset: tf.data.Dataset, seq_len : int, vocab_size = 128, ) -> tf.data.Dataset:
     seq_len = seq_len+1
+    #window - конечный набор данных
     #shift -> Сдвиг, stride -> шаг между элементами, drop_remainder -> удалять окна которые будут меньше size (seq_len)
     windows = dataset.window(seq_len, shift=1, stride=1, drop_remainder=True)
 
     #Тут мы сглаживаем
-    flt = lambda x: x.batch(seq_len, drop_remainder=True)
+    flt = lambda x: x.batch(seq_len, drop_remainder=True) #иттерация иттераций
     sequences = windows.flat_map(flt)
 
     def scale_pitch_ich_note(x): #нормализуем высоту каждой ноты, чтобы не звучало
@@ -162,10 +163,10 @@ def sequence_notes(dataset: tf.data.Dataset, seq_len : int, vocab_size = 128, ) 
 
 #делаем функцию для ноты и задержки
 def mse_handler_pitch_duration(y_true: tf.Tensor, y_pred: tf.Tensor):
-    mse = (y_true - y_pred) **2
+    mse = (y_true - y_pred) **2 #квадратичная ошибка
     print(mse)
-    pressure = 10 * tf.maximum(-y_pred, 0.0)
-    return tf.reduce_mean(mse + pressure)
+    pressure = 10 * tf.maximum(-y_pred, 0.0) #возвращает максимальное знаение
+    return tf.reduce_mean(mse + pressure) #Вычисляет среднее значение элементов по измерениям тензора
 
 
 def tf_model(seq_length, msc, instrument_name):
@@ -177,7 +178,7 @@ def tf_model(seq_length, msc, instrument_name):
     x = tf.keras.layers.LSTM(128)(inputs)
 
     outputs = {
-        'pitch': tf.keras.layers.Dense(128, name='pitch')(x),
+        'pitch': tf.keras.layers.Dense(128, name='pitch')(x), #обычный слой (размер памяти, имя)
         'step': tf.keras.layers.Dense(1, name='step')(x),
         'duration': tf.keras.layers.Dense(1, name='duration')(x),
     }
@@ -190,7 +191,7 @@ def tf_model(seq_length, msc, instrument_name):
         'step': mse_handler_pitch_duration,
         'duration': mse_handler_pitch_duration,
     }
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate) #что-то вроде градиентного спуска
     model.compile(
         loss=loss,
         loss_weights={
@@ -200,22 +201,22 @@ def tf_model(seq_length, msc, instrument_name):
         },
         optimizer=optimizer,
     )
-    model.evaluate(train_ds, return_dict=True)
+    model.evaluate(train_ds, return_dict=True) #оценка пользовательской логики???
     print(model.summary())
     losses = model.evaluate(train_ds, return_dict=True)
     print(losses)
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
+    callbacks = [ #RNN??
+        tf.keras.callbacks.ModelCheckpoint( #сохранение весов модели
             filepath='./training_checkpoints/ckpt_{epoch}',
             save_weights_only=True),
-        tf.keras.callbacks.EarlyStopping(
+        tf.keras.callbacks.EarlyStopping( #останавливаем обучение когда отслеживаемый результат перестает меняться
             monitor='loss',
             patience=5,
             verbose=1,
             restore_best_weights=True),
     ]
-    epochs = 50 #колво прогонов
-    history = model.fit(
+    epochs = 10 #колво прогонов
+    history = model.fit( #контроль за процессом обучения
         train_ds,
         epochs=epochs,
         callbacks=callbacks,
@@ -257,8 +258,8 @@ def predict_note(notes: np.ndarray, keras_model: tf.keras.Model,
     step = predictions['step']
     duration = predictions['duration']
     pitch_logits /= temperature
-    pitch = tf.random.categorical(pitch_logits, num_samples=1)
-    pitch = tf.squeeze(pitch, axis=-1)
+    pitch = tf.random.categorical(pitch_logits, num_samples=1) #категориального распределения
+    pitch = tf.squeeze(pitch, axis=-1) #удаление формы тензора?
     duration = tf.squeeze(duration, axis=-1)
     step = tf.squeeze(step, axis=-1)
     step = tf.maximum(0, step)
@@ -275,21 +276,21 @@ if __name__ == '__main__':
     row.head()
     get_more_notes = np.vectorize(pretty_midi.note_number_to_name)
     sample_note = get_more_notes(row['pitch'])
-    #plot_music_roll(row, 100)
-    #plot_music_roll(row)
-    #plot_table(row)
-    #output_file = 'try.midi'
-    #example_pm = notes_to_music_format_midi(
-        #row, out_file=output_file, instrument_name=instrument_name)
+    plot_music_roll(row, 100)
+    plot_music_roll(row)
+    plot_table(row)
+    output_file = 'try.midi'
+    example_pm = notes_to_music_format_midi(
+        row, out_file=output_file, instrument_name=instrument_name)
     test_data_set_to_train, num_note = test_learning(msc)
     seq_length = 25
     vocab_size = 128
     seq_dataset = sequence_notes(test_data_set_to_train, seq_length, vocab_size)
     batch_size = 64
-    #for seq, target in seq_dataset:
-    #    print('форма последовательности: ', seq.shape)
-    #    print('элементы последовательности: ', seq[0: 10])
-    #    print('\nтаргет: ', target)
+    for seq, target in seq_dataset:
+        print('форма последовательности: ', seq.shape)
+        print('элементы последовательности: ', seq[0: 10])
+        print('\nтаргет: ', target)
     buffer_size = num_note - seq_length
     train_ds = (seq_dataset
                 .shuffle(buffer_size)
